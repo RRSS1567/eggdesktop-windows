@@ -10,14 +10,165 @@ eggdesktop —— "桌面与桌面之间,有个桌面"
 import os
 import random
 import re
-import select
 import shutil
 import subprocess
 import sys
-import termios
 import threading
 import time
-import tty
+import unicodedata
+
+IS_WINDOWS = os.name == "nt"
+if IS_WINDOWS:
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    def _enable_windows_ansi():
+        try:
+            kernel32 = ctypes.windll.kernel32
+            h = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+            mode = wintypes.DWORD()
+            if kernel32.GetConsoleMode(h, ctypes.byref(mode)):
+                kernel32.SetConsoleMode(h, mode.value | 0x0004 | 0x0008)
+        except Exception:
+            pass
+
+    _enable_windows_ansi()
+    import winsound
+
+# ===================== 音乐 =====================
+MUSIC_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "music", "egg_room.wav")
+TEXT_SOUND_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "music", "text_tick.wav")
+MUSIC_PLAYER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "music_player.py")
+TEXT_SOUND_PLAYER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "text_sound_player.py")
+_MUSIC_STARTED = False
+_MUSIC_PROC = None
+_TEXT_SOUND_PROCS = []
+_TEXT_SOUND_INDEX = 0
+_TEXT_SOUND_LOCK = threading.Lock()
+_TEXT_SOUND_WORKERS = 8
+
+def start_behind_music():
+    """循环播放场景音乐；单独进程播放，避免文字音效打断背景音乐。"""
+    global _MUSIC_STARTED, _MUSIC_PROC
+    if not IS_WINDOWS or _MUSIC_STARTED:
+        return
+    try:
+        if os.path.isfile(MUSIC_FILE) and os.path.isfile(MUSIC_PLAYER):
+            pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+            if not os.path.isfile(pyw):
+                pyw = sys.executable
+            _MUSIC_PROC = subprocess.Popen(
+                [pyw, MUSIC_PLAYER, MUSIC_FILE, str(os.getpid())],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            _MUSIC_STARTED = True
+    except Exception:
+        _MUSIC_PROC = None
+        _MUSIC_STARTED = False
+
+def stop_behind_music():
+    """停止场景音乐。"""
+    global _MUSIC_STARTED, _MUSIC_PROC
+    if not IS_WINDOWS:
+        return
+    try:
+        if _MUSIC_PROC and _MUSIC_PROC.poll() is None:
+            _MUSIC_PROC.terminate()
+            try:
+                _MUSIC_PROC.wait(timeout=0.5)
+            except Exception:
+                _MUSIC_PROC.kill()
+        else:
+            winsound.PlaySound(None, 0)
+    except Exception:
+        pass
+    _MUSIC_PROC = None
+    _MUSIC_STARTED = False
+
+# 无论是正常退出、Ctrl+C，还是窗口/CMD 被关闭，都尽量立即停止音乐。
+import atexit
+atexit.register(stop_behind_music)
+
+def _ensure_text_sound_workers():
+    """启动一小组独立声音进程，让多个字符音效可以重叠播放。"""
+    global _TEXT_SOUND_PROCS
+    if not IS_WINDOWS or not os.path.isfile(TEXT_SOUND_FILE) or not os.path.isfile(TEXT_SOUND_PLAYER):
+        return
+    pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+    if not os.path.isfile(pyw):
+        pyw = sys.executable
+    alive = [p for p in _TEXT_SOUND_PROCS if p.poll() is None and p.stdin is not None]
+    _TEXT_SOUND_PROCS = alive
+    while len(_TEXT_SOUND_PROCS) < _TEXT_SOUND_WORKERS:
+        try:
+            proc = subprocess.Popen(
+                [pyw, TEXT_SOUND_PLAYER, TEXT_SOUND_FILE, str(os.getpid())],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            _TEXT_SOUND_PROCS.append(proc)
+        except Exception:
+            break
+
+def stop_text_sound_workers():
+    """结束所有文字音效工作进程。"""
+    global _TEXT_SOUND_PROCS
+    with _TEXT_SOUND_LOCK:
+        for proc in _TEXT_SOUND_PROCS:
+            try:
+                if proc.stdin:
+                    proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                if proc.poll() is None:
+                    proc.terminate()
+            except Exception:
+                pass
+        for proc in _TEXT_SOUND_PROCS:
+            try:
+                proc.wait(timeout=0.3)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        _TEXT_SOUND_PROCS = []
+
+
+def play_text_sound():
+    """每输出一个可见字符触发一次音效；8 个独立 worker 允许音效重叠。"""
+    global _TEXT_SOUND_INDEX
+    if not IS_WINDOWS:
+        return
+    with _TEXT_SOUND_LOCK:
+        try:
+            _ensure_text_sound_workers()
+            if not _TEXT_SOUND_PROCS:
+                return
+            # 轮询分配。主程序每生成一个字符就写入一次触发信号。
+            n = len(_TEXT_SOUND_PROCS)
+            for _ in range(n):
+                proc = _TEXT_SOUND_PROCS[_TEXT_SOUND_INDEX % n]
+                _TEXT_SOUND_INDEX = (_TEXT_SOUND_INDEX + 1) % max(1, n)
+                if proc.poll() is not None or proc.stdin is None:
+                    continue
+                try:
+                    proc.stdin.write(b"1\n")
+                    proc.stdin.flush()
+                    return
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+atexit.register(stop_text_sound_workers)
 
 # ===================== 配置区(拍视频要改的都集中在这里) =====================
 SHOW_DATE = None                    # 登录横幅日期: None = 跟随真实系统时间;
@@ -39,7 +190,7 @@ SPAWN_ON = "acquire"                # "exit": 退出终端后蛋出现在菜单�
                                     # "acquire": 拿到蛋的瞬间就出现(选 Yes 的刹那)
 # ===========================================================================
 
-EGG_LINE = "Not too important, not too unimportant."
+EGG_LINE = "没那么重要，也没那么不重要。"
 EGGBAR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "eggbar")
 
 PX = {"R": (0xE0, 0x20, 0x40),   # 树冠正红
@@ -54,6 +205,9 @@ FRAMES = [['                                                              RRRRRR
 
 CSI = "\x1b["
 RESET = CSI + "0m"
+# Match ANSI/VT escape sequences so the typewriter can print them atomically.
+# Windows Terminal and modern CMD both understand these sequences when ANSI is enabled.
+ESC_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|[@-_])")
 
 
 def fg(rgb):
@@ -262,13 +416,215 @@ class Tree:
             sys.stdout.flush()
 
 
+# Windows unified story renderer: one thread owns terminal writes while man tree
+# is running. This keeps the animated tree and Chinese typewriter text in one frame.
+STORY_MODE = [False]
+STORY_STOP = threading.Event()
+STORY_THREAD = [None]
+STORY_LOCK = threading.RLock()
+STORY_LINES = []
+STORY_CURRENT = [""]
+STORY_INPUT = [""]
+STORY_PROMPT = [""]
+
+def _cell_width(ch):
+    import unicodedata
+    if ch == "\t":
+        return 4
+    if unicodedata.east_asian_width(ch) in ("W", "F"):
+        return 2
+    return 1
+
+def _wrap_story(text, width):
+    out, line, used = [], "", 0
+    for ch in text:
+        if ch == "\n":
+            out.append(line); line = ""; used = 0
+            continue
+        w = _cell_width(ch)
+        if used + w > width and line:
+            out.append(line); line = ch; used = w
+        else:
+            line += ch; used += w
+    out.append(line)
+    return out
+
+def _story_build_lines(width):
+    lines = []
+    for x in STORY_LINES:
+        lines.extend(_wrap_story(x, width))
+    if STORY_CURRENT[0]:
+        lines.extend(_wrap_story(STORY_CURRENT[0], width))
+    return lines
+
+
+def _story_render_once(frame_idx=None):
+    """同步绘制当前剧情状态，并把光标放到下一行，供主循环继续打印提示符。"""
+    if not TREE.esc_frames:
+        return
+    try:
+        tw, _ = shutil.get_terminal_size((80, 24))
+    except Exception:
+        tw = 80
+    width = max(10, tw - 2)
+    with STORY_LOCK:
+        lines = _story_build_lines(width)
+        if frame_idx is None:
+            frame_idx = TREE.frame_idx % len(TREE.esc_frames)
+        max_rows = max(1, TREE.th - TREE.lines - 2)
+        visible = lines[-max_rows:]
+        base = TREE.lines + 2
+        with TREE.lock:
+            sys.stdout.write(TREE.esc_frames[frame_idx])
+            sys.stdout.write(f"{CSI}{base};1H{CSI}0J")
+            row = base
+            for line in visible:
+                sys.stdout.write(f"{CSI}{row};1H{CSI}2K{line}")
+                row += 1
+            # 关键修复：上一版渲染完最后一行后，光标仍停在该行末尾，
+            # 所以主循环紧接着打印 man tree 提示符时会和剧情粘在同一行。
+            # 现在显式把光标放到剧情区下一行。
+            sys.stdout.write(f"{CSI}{base + len(visible)};1H")
+            sys.stdout.flush()
+
+
+def _story_render():
+    """Windows 统一渲染器：文字高频刷新，树按独立节奏换帧。
+
+    STORY_MODE 开启期间，剧情区完全由此线程绝对定位重绘；外部不得
+    用裸 emit() 写入换行，否则会把终端光标移走并与重绘造成文字重叠。
+    """
+    frame_idx = 0
+    next_frame = time.monotonic()
+    render_delay = 0.025  # 约 40 FPS，保证打字机不会卡顿
+
+    while not STORY_STOP.wait(render_delay):
+        now = time.monotonic()
+
+        with STORY_LOCK:
+            if not STORY_MODE[0] or not TREE.esc_frames:
+                continue
+
+            # 树只按自己的速度换帧；渲染循环本身保持高频运行。
+            if now >= next_frame:
+                frame_idx = (frame_idx + 1) % len(TREE.esc_frames)
+                TREE.frame_idx = frame_idx
+                next_frame = now + FRAME_DELAY
+
+            try:
+                tw, _ = shutil.get_terminal_size((80, 24))
+            except Exception:
+                tw = 80
+
+            width = max(10, tw - 2)
+            lines = _story_build_lines(width)
+
+            # 每 25ms 刷新一次文字，因此中文打字机不会被 0.30 秒的树动画间隔拖慢。
+            with TREE.lock:
+                sys.stdout.write(TREE.esc_frames[frame_idx])
+                base = TREE.lines + 2
+                sys.stdout.write(f"{CSI}{base};1H{CSI}0J")
+                row = base
+                max_rows = max(1, TREE.th - TREE.lines - 2)
+                visible = lines[-max_rows:]
+                for line in visible:
+                    sys.stdout.write(f"{CSI}{row};1H{CSI}2K{line}")
+                    row += 1
+                # 保持光标在剧情区最后一行的下一行，避免后续 man tree 提示符粘行。
+                sys.stdout.write(f"{CSI}{base + len(visible)};1H")
+                sys.stdout.flush()
+
+def _story_start():
+    if not IS_WINDOWS:
+        return
+    # Stop the old tree-only renderer; the new renderer animates the tree itself.
+    if TREE.thread:
+        TREE.stop.set()
+        TREE.thread.join(timeout=1)
+        TREE.thread = None
+    STORY_LINES.clear()
+    STORY_CURRENT[0] = ""
+    STORY_INPUT[0] = ""
+    STORY_PROMPT[0] = ""
+    STORY_STOP.clear()
+    STORY_MODE[0] = True
+    t = threading.Thread(target=_story_render, daemon=True)
+    STORY_THREAD[0] = t
+    t.start()
+
+def _story_stop():
+    if not IS_WINDOWS:
+        return
+    # 在线程停下前先把最后一帧剧情同步落盘，防止最后一个字还没来得及
+    # 被 25 FPS 渲染线程画出来就被立即切回普通终端。
+    with STORY_LOCK:
+        if STORY_MODE[0] and TREE.esc_frames:
+            _story_render_once(TREE.frame_idx)
+    STORY_MODE[0] = False
+    STORY_STOP.set()
+    t = STORY_THREAD[0]
+    if t:
+        t.join(timeout=1)
+    STORY_THREAD[0] = None
+
+def _story_add_char(ch):
+    with STORY_LOCK:
+        STORY_CURRENT[0] += ch
+
+def _story_newline():
+    with STORY_LOCK:
+        if STORY_CURRENT[0]:
+            STORY_LINES.append(STORY_CURRENT[0])
+        STORY_CURRENT[0] = ""
+
+def _story_wait_key():
+    wait_key()
+
+def _story_typewriter(text, newline=True, ff=True):
+    # Keep the original timing and skip-to-end behavior, but update only state.
+    if not sys.stdin.isatty():
+        _story_add_char(text)
+        if newline: _story_newline()
+        return
+    for ch in text:
+        _story_add_char(ch)
+        if not ch.isspace():
+            play_text_sound()
+        deadline = time.time() + DELAY_CHAR
+        while time.time() < deadline:
+            if msvcrt.kbhit():
+                c = _win_key()
+                if c is None:
+                    continue
+                if ord(c) == 0x03:
+                    raise KeyboardInterrupt
+                if c in ("\r", "\n") and ff:
+                    # Finish the remainder immediately.
+                    for rest in text[text.index(ch) + 1:]:
+                        _story_add_char(rest)
+                    if newline: _story_newline()
+                    return
+            time.sleep(0.005)
+    if newline:
+        _story_newline()
+
 TREE = Tree()
 OLD_TERM = [None]                 # 启动前的终端属性, 退出时恢复(程序全程关回显)
 DIRTY = [False]                   # 本轮指令是否产生过可见输出(输错刷新指令区用)
 
 
+def _windows_text_safe(text):
+    """Windows Terminal 对部分中文字体的东亚宽字符处理不一致。
+    仅对普通可见中文文本做逐行宽度保护；ANSI/换行/控制序列保持原样。
+    不插入额外空格，避免改变剧情排版；原位重写另行使用 _cell_width。
+    """
+    return text
+
+
 def emit(text):
-    """所有终端输出统一走这里, 与动画线程互斥。"""
+    """所有终端输出统一走这里，与动画线程互斥。"""
+    if IS_WINDOWS:
+        text = _windows_text_safe(text)
     with TREE.lock:
         sys.stdout.write(text)
         sys.stdout.flush()
@@ -276,19 +632,98 @@ def emit(text):
         DIRTY[0] = True
 
 
+def _win_key():
+    """Read one Windows console key without echo."""
+    ch = msvcrt.getwch()
+    if ch in ("\x00", "\xe0"):
+        # Extended key: consume its scan-code byte.
+        try:
+            msvcrt.getwch()
+        except Exception:
+            pass
+        return None
+    return ch
+
+
+def _win_flush():
+    while msvcrt.kbhit():
+        try:
+            msvcrt.getwch()
+        except Exception:
+            break
+
+
+def _win_cursor(show):
+    # Windows Terminal/CMD both understand VT cursor control when enabled.
+    # Keep this isolated so transition code never depends on POSIX termios.
+    emit(CSI + ("?25h" if show else "?25l"))
+
+
 def read_command():
-    """原始模式逐字符读一行: 显式处理退格(DEL/BS/^B), 回显走 emit 互斥锁,
-    避免动画重绘与终端行 disciplines 互相干扰。非 tty(管道)时退回普通读行。
-    setraw 用 TCSADRAIN 而非默认的 TCSAFLUSH: 打字机/演出期间提前敲入的字符
-    已在队里(程序全程关回显, 不会错位), 不能被冲掉, 要接着读出来。
-    返回 None 表示 EOF(^D / 管道结束)。"""
+    """Cross-platform raw-ish command line reader with explicit echo."""
+    if IS_WINDOWS:
+        if STORY_MODE[0] and sys.stdin.isatty():
+            buf = []
+            _win_cursor(False)
+            while True:
+                ch = _win_key()
+                if ch is None:
+                    continue
+                o = ord(ch)
+                if o in (0x7F, 0x08, 0x02):
+                    if buf:
+                        buf.pop()
+                        with STORY_LOCK:
+                            STORY_CURRENT[0] = STORY_PROMPT[0] + "".join(buf)
+                elif o in (0x0D, 0x0A):
+                    line = "".join(buf)
+                    with STORY_LOCK:
+                        STORY_CURRENT[0] = STORY_PROMPT[0] + line
+                    _story_newline()
+                    return line
+                elif o == 0x03:
+                    raise KeyboardInterrupt
+                elif ch.isprintable():
+                    buf.append(ch)
+                    with STORY_LOCK:
+                        STORY_CURRENT[0] = STORY_PROMPT[0] + "".join(buf)
+        if not sys.stdin.isatty():
+            line = sys.stdin.readline()
+            return None if line == "" else line.rstrip("\r\n")
+        buf = []
+        _win_cursor(True)
+        try:
+            while True:
+                ch = _win_key()
+                if ch is None:
+                    continue
+                o = ord(ch)
+                if o in (0x7F, 0x08, 0x02):
+                    if buf:
+                        buf.pop()
+                        emit("\b \b")
+                elif o in (0x0D, 0x0A):
+                    emit("\r\n")
+                    return "".join(buf)
+                elif o == 0x04 and not buf:
+                    emit("\r\n")
+                    return None
+                elif o == 0x03:
+                    raise KeyboardInterrupt
+                elif ch.isprintable():
+                    # 空格也是有效的命令行字符；不能用 isspace() 把它过滤掉。
+                    buf.append(ch)
+                    emit(ch)
+        finally:
+            _win_cursor(False)
     if not sys.stdin.isatty():
         line = sys.stdin.readline()
         return None if line == "" else line.rstrip("\n")
     fd = sys.stdin.fileno()
+    import termios, tty
     old = termios.tcgetattr(fd)
     buf = []
-    emit(CSI + "?25h")              # 只在等待输入时还回光标
+    emit(CSI + "?25h")
     try:
         tty.setraw(fd, termios.TCSADRAIN)
         while True:
@@ -296,19 +731,19 @@ def read_command():
             if ch == "":
                 return None
             o = ord(ch)
-            if o in (0x7F, 0x08, 0x02):        # 退格: DEL / BS / ^B
+            if o in (0x7F, 0x08, 0x02):
                 if buf:
                     buf.pop()
                     emit("\b \b")
-            elif o in (0x0D, 0x0A):            # 回车
+            elif o in (0x0D, 0x0A):
                 emit("\r\n")
                 return "".join(buf)
-            elif o == 0x04 and not buf:        # ^D = EOF
+            elif o == 0x04 and not buf:
                 emit("\r\n")
                 return None
-            elif o == 0x03:                    # ^C
+            elif o == 0x03:
                 raise KeyboardInterrupt
-            elif o == 0x1B:                    # 方向键等转义序列, 整段吞掉
+            elif o == 0x1B:
                 nxt = sys.stdin.read(1)
                 if nxt == "[":
                     while True:
@@ -320,16 +755,25 @@ def read_command():
                 emit(ch)
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
-        emit(CSI + "?25l")          # 输入结束立刻藏回: 打印/动画期间没有突兀的游标
+        emit(CSI + "?25l")
 
 
 def wait_key():
-    """非 Y/N 叙事行的"按 Enter 继续": 先冲掉演出期间排队的老输入,
-    再等待一次回车——终端语境里 Enter 才是"继续", 其余按键一律吞掉,
-    演出期间乱打字不会快进对话, 也不会污染下一条命令。管道模式直接跳过。"""
     if not sys.stdin.isatty():
         return
+    if IS_WINDOWS:
+        _win_flush()
+        while True:
+            ch = _win_key()
+            if ch is None:
+                continue
+            o = ord(ch)
+            if o == 0x03:
+                raise KeyboardInterrupt
+            if o in (0x0D, 0x0A):
+                return
     fd = sys.stdin.fileno()
+    import termios, tty
     old = termios.tcgetattr(fd)
     try:
         tty.setraw(fd, termios.TCSADRAIN)
@@ -341,34 +785,26 @@ def wait_key():
             o = ord(ch)
             if o == 0x03:
                 raise KeyboardInterrupt
-            if o in (0x0D, 0x0A):           # 只认 Enter
+            if o in (0x0D, 0x0A):
                 return
-            if o == 0x1B:                   # 方向键等转义序列, 整段吞掉
+            if o == 0x1B:
                 nxt = sys.stdin.read(1)
                 if nxt == "[":
                     while True:
                         c = sys.stdin.read(1)
                         if c == "" or 0x40 <= ord(c) <= 0x7E:
                             break
-            # 其余按键静默吞掉
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
-ESC_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b.")
-
-
 def typewriter(text, newline=True, ff=True):
-    """打字机逐字打印; ff=True 时按 Enter 立即补完当前行(其余按键吞掉)。
-    newline=False 时打完停在本行行尾(say 把换行时机交给下一次 Enter)。
-    ff=False(Y/N 交互句)既不快进也不留队: 打印期间一切输入吞掉,
-    整句(含选项)印完后输入才有效, 防误触。非 tty 时整行直出。
-    转义序列(如加粗)整体切出、原子输出: 逐字拆断 ESC 会被动画帧
-    夹坏终端的解析状态, 造成光标乱跳/残片。"""
+    if IS_WINDOWS and STORY_MODE[0]:
+        _story_typewriter(text, newline=newline, ff=ff)
+        return
     if not sys.stdin.isatty():
         emit(text + ("\n" if newline else ""))
         return
-    # 切成 (是否转义序列, 片段, 片段在原文结束的偏移): 转义序列不占节拍
     parts = []
     pos = 0
     for m in ESC_RE.finditer(text):
@@ -378,18 +814,51 @@ def typewriter(text, newline=True, ff=True):
         pos = m.end()
     for j in range(pos, len(text)):
         parts.append((False, text[j], j + 1))
-    fd = sys.stdin.fileno()
-    old = termios.tcgetattr(fd)
-    try:
-        tty.setraw(fd, termios.TCSADRAIN)
-        termios.tcflush(fd, termios.TCIFLUSH)   # 演出期间排队的输入不作数
+
+    if IS_WINDOWS:
+        _win_flush()
         i = 0
         while i < len(parts):
             is_esc, chunk, raw_end = parts[i]
             emit(chunk)
             i += 1
             if is_esc:
-                continue                    # 转义序列原子输出, 不占节拍
+                continue
+            # Windows 普通剧情（非统一故事渲染器）也保持逐字打字机，并且
+            # 每个非空白可见字符触发一次文字音效。
+            if chunk and not chunk.isspace():
+                play_text_sound()
+            deadline = time.time() + DELAY_CHAR
+            while time.time() < deadline:
+                if not msvcrt.kbhit():
+                    time.sleep(0.01)
+                    continue
+                c = _win_key()
+                if c is None:
+                    continue
+                if ord(c) == 0x03:
+                    raise KeyboardInterrupt
+                if c in ("\r", "\n") and ff:
+                    remainder = text[raw_end:]
+                    emit(remainder + ("\r\n" if newline else ""))
+                    return
+        if newline:
+            emit("\r\n")
+        return
+
+    fd = sys.stdin.fileno()
+    import termios, tty, select
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd, termios.TCSADRAIN)
+        termios.tcflush(fd, termios.TCIFLUSH)
+        i = 0
+        while i < len(parts):
+            is_esc, chunk, raw_end = parts[i]
+            emit(chunk)
+            i += 1
+            if is_esc:
+                continue
             deadline = time.time() + DELAY_CHAR
             while time.time() < deadline:
                 if not select.select([fd], [], [], 0.01)[0]:
@@ -397,28 +866,64 @@ def typewriter(text, newline=True, ff=True):
                 c = os.read(fd, 1)
                 if c == b"\x03":
                     raise KeyboardInterrupt
-                if c in (b"\r", b"\n") and ff:  # Enter: 直接补完当前行
+                if c in (b"\r", b"\n") and ff:
                     emit(text[raw_end:] + ("\r\n" if newline else ""))
                     return
-                # 其余按键(Y/N 句里连 Enter 也算)静默吞掉
         if newline:
-            emit("\r\n")            # raw 模式下 OPOST 关闭, 裸 \n 不换列
+            emit("\r\n")
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
 def say(text):
-    """叙事行: 打字机逐字打(Enter 可补完), 光标停在行尾——不提前换行;
-    再按 Enter 才换行并进下一行(没有突兀的换行留白)。"""
+    """显示剧情：Windows 全程使用打字机；story 模式由统一渲染器绘制。"""
+    if IS_WINDOWS and STORY_MODE[0]:
+        _story_typewriter(text, newline=False)
+        _story_wait_key()
+        _story_newline()
+        return
+    if IS_WINDOWS and sys.stdin.isatty():
+        # 不再瞬间打印：cd .behind 后的开场文字、以及最后几句结尾文字，
+        # 都走和前面一致的逐字打字机 + 字符音效。此时树仍在动画线程中，
+        # 因此调用方会在这些剧情段开始前切到 STORY_MODE。
+        typewriter(text, newline=False, ff=True)
+        wait_key()
+        emit("\r\n")
+        return
     typewriter(text, newline=False)
     wait_key()
     emit("\r\n")
 
 
+
+def _resume_tree_animation():
+    """剧情结束后恢复普通树动画；光标位置由剧情渲染器预先放到下一行。"""
+    if not IS_WINDOWS:
+        return
+    if TREE.active and TREE.esc_frames and TREE.thread is None:
+        TREE.stop.clear()
+        TREE.thread = threading.Thread(target=TREE._animate, daemon=True)
+        TREE.thread.start()
+
+
 def spawn_eggbar():
+    if IS_WINDOWS:
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "eggbar_win.py")
+        if not os.path.exists(script):
+            return
+        pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+        if not os.path.exists(pyw):
+            pyw = sys.executable
+        try:
+            subprocess.Popen([pyw, script],
+                             stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL,
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except Exception:
+            pass
+        return
     if not (os.path.exists(EGGBAR) and os.access(EGGBAR, os.X_OK)):
         return
-    # 菜单栏里已经住着一颗就不再召唤(反复录制不会堆出多颗蛋)
     if subprocess.run(["pgrep", "-x", "eggbar"],
                       stdout=subprocess.DEVNULL,
                       stderr=subprocess.DEVNULL).returncode == 0:
@@ -454,15 +959,41 @@ def glitch_mask(grid, ratio):
 
 
 def freeze_glitch(seconds, do_glitch=True):
-    """假死: 定格期间吞掉一切键盘输入(不回显、不缓冲到后续命令);
-    do_glitch 且树正在显示时, 一次性把斑块状分布的色块腐化为 ASCII 并保持定格。"""
+    """Freeze the current tree while swallowing Windows console input.
+
+    On Windows msvcrt is already in console mode; unlike POSIX we must not
+    try to emulate termios/ICANON.  In particular, changing console/input
+    state during the .behind transition can make the launcher appear to
+    crash or leave the console in a broken state.
+    """
+    if IS_WINDOWS:
+        try:
+            _win_flush()
+            grid = TREE.grids[TREE.frame_idx] if TREE.grids else None
+            if do_glitch and grid:
+                with TREE.lock:
+                    for x, y in glitch_mask(grid, GLITCH_RATIO):
+                        TREE.write_cell_ascii(y, x, grid[y][x])
+                    sys.stdout.flush()
+            end = time.monotonic() + seconds
+            while time.monotonic() < end:
+                # Consume keys without ever echoing them or changing console mode.
+                _win_flush()
+                time.sleep(0.02)
+            _win_flush()
+        except (OSError, ValueError):
+            # A closed/replaced console should not take down the whole program.
+            time.sleep(seconds)
+        return
+
     noecho = sys.stdin.isatty()
     fd = sys.stdin.fileno() if noecho else None
+    import termios
     old = termios.tcgetattr(fd) if noecho else None
     try:
         if noecho:
             new = termios.tcgetattr(fd)
-            new[3] &= ~(termios.ECHO | termios.ICANON)  # 关回显与行缓冲
+            new[3] &= ~(termios.ECHO | termios.ICANON)
             termios.tcsetattr(fd, termios.TCSADRAIN, new)
         grid = TREE.grids[TREE.frame_idx] if TREE.grids else None
         if do_glitch and grid:
@@ -470,9 +1001,9 @@ def freeze_glitch(seconds, do_glitch=True):
                 for x, y in glitch_mask(grid, GLITCH_RATIO):
                     TREE.write_cell_ascii(y, x, grid[y][x])
                 sys.stdout.flush()
-        time.sleep(seconds)                            # 定格保持
+        time.sleep(seconds)
         if noecho:
-            termios.tcflush(fd, termios.TCIFLUSH)      # 丢弃定格期间的所有输入
+            termios.tcflush(fd, termios.TCIFLUSH)
     finally:
         if noecho:
             termios.tcsetattr(fd, termios.TCSADRAIN, old)
@@ -501,12 +1032,38 @@ class State:
 
 # 蛋房开场两行: 进场时命令用词被抹去(留空), 两个空合起来就是 man tree;
 # 输入 man tree 的刹那显形为完整的句子(留空与词一一对应)
-OPEN_BLANK = ("* (So many parallel worlds. So many ____s, "
-              "so many eggs. And yet, here you are again.)",
-              "* (Well, there is a ___ here, too.)")
-OPEN_FULL = ("* (So many parallel worlds. So many trees, "
-             "so many eggs. And yet, here you are again.)",
-             "* (Well, there is a man here, too.)")
+OPEN_BLANK = ("*（这么多平行世界，这么多____，"
+              "这么多蛋。而你还是再次来到了这里。）",
+              "*（嗯，这里也有一个___。）")
+OPEN_FULL = ("*（这么多平行世界，这么多树，"
+             "这么多蛋。而你还是再次来到了这里。）",
+             "*（嗯，这里也有一个男人。）")
+
+def _cell_width(text):
+    """计算终端显示宽度：中文/全角字符占 2 格，ASCII 占 1 格。"""
+    width = 0
+    for ch in text:
+        if unicodedata.combining(ch):
+            continue
+        width += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return width
+
+def _preserve_line_width(text, target_width):
+    """原位重写剧情文本时严格保持终端列宽。
+
+    Windows Terminal 按东亚宽字符占 2 列处理中文。原版的
+    ASCII 下划线占 1 列，直接替换会造成后续字符错列，因此这里
+    按显示列宽计算，并在不足时补空格；超出时按显示列截断。
+    """
+    out = []
+    width = 0
+    for ch in text:
+        w = 0 if unicodedata.combining(ch) else (2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1)
+        if width + w > target_width:
+            break
+        out.append(ch)
+        width += w
+    return "".join(out) + " " * max(0, target_width - width)
 
 
 def enter_behind(st):
@@ -522,25 +1079,40 @@ def enter_behind(st):
     freeze_glitch(PAUSE_BLACK, do_glitch=st.fresh_cat)
     st.fresh_cat = False
     TREE.present()
-    emit("\n")
+    # 树已经完整显现后，立刻切换到统一渲染器；随后才启动背景音乐。
+    # 这样 cd .behind 后的两行开场文字也走同一套打字机 + 音效，
+    # 同时不会和树动画线程抢终端输出。
+    _story_start()
+    start_behind_music()
+    # STORY_MODE 开启后由统一渲染器管理剧情区光标，不能再注入裸换行。
     st.cwd = "~/.behind"
     if st.egg or st.man_gone:
-        say("* (Well, there is not a man here.)")
+        say("*（这里已经没有那个男人了。）")
     else:
         say(OPEN_BLANK[0])
         say(OPEN_BLANK[1])
 
+    # 开场两行显示完后，必须退出剧情渲染模式，才能把控制权还给
+    # 主循环显示普通命令提示符并继续输入 man tree 等命令。
+    # 同时恢复普通树动画；否则统一剧情渲染器停止后树会冻结在最后一帧。
+    _story_stop()
+    # 剧情渲染器已经把光标放在剧情区的下一行；这里不要再输出换行，
+    # 否则会多出一个空白行，导致后面的命令提示符隔一行出现。
+    _resume_tree_animation()
+
 
 def reveal_opening():
-    """man tree 咏唱成功的刹那: 开场两行里被抹去的词立刻显形(原位重写)。
+    """man tree 成功后，原位的待填空旁白一次性替换成完整中文。
 
-    开场两行由 enter_behind 打印在文本区第 2、3 行
-    (present 把光标放在 lines+2, emit 换行后再打两行)。
-    """
+    Windows 上不要逐字改写中文行；直接清行并一次性输出，避免双宽字符
+    在终端重绘期间出现重叠。"""
     with TREE.lock:
+        # 与剧情渲染器保持同一基准：剧情区第一行是 TREE.lines + 2，
+        # 第二行是 TREE.lines + 3。上一版偏移了一行，导致第一行的
+        # ____ 没有被正确替换。
         sys.stdout.write("\x1b7"
-                         + f"{CSI}{TREE.lines + 3};1H{CSI}0K" + OPEN_FULL[0]
-                         + f"{CSI}{TREE.lines + 4};1H{CSI}0K" + OPEN_FULL[1]
+                         + f"{CSI}{TREE.lines + 2};1H{CSI}2K" + OPEN_FULL[0]
+                         + f"{CSI}{TREE.lines + 3};1H{CSI}2K" + OPEN_FULL[1]
                          + "\x1b8")
         sys.stdout.flush()
 
@@ -568,18 +1140,24 @@ def offer(st):
     reveal_opening()            # 下划线立刻被正确字符替换
     time.sleep(1.0)             # 显形留一拍
     TREE.clear_text_area()      # 超行重置对话区, 后续对话从干净区域开始
-    say("* (Countless reunions later, he is still happy to see you.)")
-    say("* (He believes you won't forget him anymore. "
-        "None of you will.)")
-    say("TAKE THIS TO REMEMBER ME. LIKE ALWAYS.")
-    say("YOU WON'T REFUSE, WILL YOU?")
-    typewriter("Take the Egg? [Yes/No] ", newline=False, ff=False)
+    _story_start()
+    say("*（经历了无数次重逢之后，他见到你依然很高兴。）")
+    say("*（他相信你不会再忘记他了。"
+        "你们谁都不会忘记。）")
+    say("拿着这个，像往常一样，记住我。")
+    say("你不会拒绝，对吧？")
+    STORY_PROMPT[0] = "要拿走蛋吗？[是/否] " if STORY_MODE[0] else ""
+    if STORY_MODE[0]:
+        with STORY_LOCK:
+            STORY_CURRENT[0] += STORY_PROMPT[0]
+    else:
+        typewriter(STORY_PROMPT[0], newline=False, ff=False)
     try:
         ans = (read_command() or "n").strip().lower()
     except KeyboardInterrupt:
         emit("\n")
         ans = "n"
-    if not ans.startswith("y"):
+    if not (ans.startswith("y") or ans.startswith("是")):
         # 不带走这个时空的蛋: 假死+斑块腐化 → 清屏重演, 只剩只有树的文本
         st.man_gone = True
         if TREE.active:
@@ -588,36 +1166,47 @@ def offer(st):
                 TREE.thread.join(timeout=1)
                 TREE.thread = None
             TREE.active = False
+        _story_stop()
         freeze_glitch(PAUSE_BLACK, do_glitch=True)
         TREE.present()          # 清屏重演: 只剩树
-        emit("\n")
-        say("* (Well, there is not a man here.)")
+        _story_start()          # 结尾文字继续使用统一渲染器 + 打字机音效
+        say("*（这里已经没有那个男人了。）")
+        _story_stop()
+        # 不再额外换行：否则结尾剧情后的命令提示符会多出一个空白行。
+        _resume_tree_animation()
         return
     st.egg = True               # 选 Yes 的刹那: 蛋到手, 立刻进菜单栏
     if SPAWN_ON == "acquire":
         spawn_eggbar()
-    say("* (You received an Egg.)")
-    typewriter("Ask for \x1b[1mone\x1b[0m more egg? [Yes/No] ",
-               newline=False, ff=False)
+    say("*（你得到了一个蛋。）")
+    STORY_PROMPT[0] = "还要再要一个蛋吗？[是/否] " if STORY_MODE[0] else ""
+    if STORY_MODE[0]:
+        with STORY_LOCK:
+            STORY_CURRENT[0] += STORY_PROMPT[0]
+    else:
+        typewriter(STORY_PROMPT[0], newline=False, ff=False)
     try:
         more = (read_command() or "n").strip().lower()
     except KeyboardInterrupt:
         emit("\n")
         more = "n"
-    if more.startswith("y"):
-        say("* (The man pointed to where you came from.)")
-        say("* (A row of trees stretched out before you, "
-            "like a hall of mirrors—)")
-        say("* (No. Countless rows. And no two of them alike.)")
-    say("* (Before you could collect yourself, he was already "
-        "smiling and waving goodbye.)")
+    if more.startswith("y") or more.startswith("是"):
+        say("*（男人指向了你来时的方向。）")
+        say("*（一排排树木延伸到你眼前，宛如一座镜厅——）")
+        say("*（不，是无数排树。而且没有两棵完全相同。）")
+    say("*（还没等你回过神来，他已经笑着向你挥手告别了。）")
     st.man_gone = True
     time.sleep(2.5)             # 告别与收蛋都落定, 再清屏
+    _story_stop()
     TREE.present()              # 清屏重演: 只剩树
-    emit("\n")
-    say("* (Well, there is not a man here.)")
-    say("* (You couldn't help but feel relieved.)")
-    say("* (He didn't fill you with melancholy.)")
+    _story_start()              # 最后的三句也保持打字机 + 音效
+    say("*（这里已经没有那个男人了。）")
+    say("*（你不由得感到一阵释然。）")
+    say("*（他没有让你感到忧郁。）")
+    _story_stop()
+    # 剧情渲染器已经把光标放在剧情区的下一行；这里不要再输出换行，
+    # 否则会多出一个空白行，导致后面的命令提示符隔一行出现。
+    _resume_tree_animation()
 
 
 def prompt_str(st):
@@ -628,16 +1217,18 @@ def run():
     st = State()
     if SHOW_DATE:
         banner_date = SHOW_DATE
-    else:  # macOS 的 Last login 格式, 个位数日期空格填充
+    else:
         now = time.localtime()
-        banner_date = time.strftime("%a %b", now) + f" {now.tm_mday:2d}" \
-            + time.strftime(" %H:%M:%S", now)
+        weekdays = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
+        banner_date = f"{weekdays[now.tm_wday]} {now.tm_mon}月{now.tm_mday}日 {now.tm_hour:02d}:{now.tm_min:02d}:{now.tm_sec:02d}"
     if sys.stdin.isatty():
-        emit(CSI + "?25l")      # 全程藏起光标, 只在等待输入时还回(read_command)
-    emit(f"Last login: {banner_date} on ttys000\n")
+        emit(CSI + "?25l")
+    tty_name = "控制台" if IS_WINDOWS else "终端"
+    emit(f"最后登录：{banner_date}，终端：{tty_name}\n")
     # 程序全程接管回显: 演出/打字机期间提前敲的字符不回显、不错位,
     # 静默排队, 由 read_command 在提示符后统一回显; 退出时恢复
-    if sys.stdin.isatty():
+    if sys.stdin.isatty() and not IS_WINDOWS:
+        import termios
         fd0 = sys.stdin.fileno()
         OLD_TERM[0] = termios.tcgetattr(fd0)
         noecho = termios.tcgetattr(fd0)
@@ -667,7 +1258,7 @@ def run():
         # 树后不是文件系统: 除 man/cd/exit/whoami 与蛋相关命令外, 一律 not found
         if st.cwd != "~" and cmd not in ("man", "cd", "exit", "quit", "logout",
                                          "egg", "help", "whoami"):
-            emit(f"zsh: command not found: {cmd}\n")
+            emit(f"找不到命令：{cmd}\n")
         elif cmd == "ls":
             all_flag = any(a.startswith("-") and "a" in a for a in args)
             operands = [a for a in args if not a.startswith("-")]
@@ -693,62 +1284,65 @@ def run():
                         emit(".  ..\n" if all_flag else "")
                     else:
                         # 未揭示的 .behind 与其他名字: 查无此物
-                        emit(f"ls: {op}: No such file or directory\n")
+                        emit(f"ls：{op}：没有那个文件或目录\n")
         elif cmd == "cat":
             if args and args[0] == "tree" and st.cwd == "~":
                 TREE.present()
+                # 树完整出现后再开始背景音乐。
+                start_behind_music()
                 st.tree_seen = True       # 揭示 .behind
                 st.fresh_cat = True       # 允许下次进 .behind 时腐化
             elif args:
-                emit(f"cat: {args[0]}: No such file or directory\n")
+                emit(f"cat：{args[0]}：没有那个文件或目录\n")
         elif cmd == "whoami":
             emit(USER + "\n")
             if st.cwd != "~":
                 # "之间"的区域: HP 变回 90, 等级 LV1, 称号被移除
                 # title 字段存在而值为空 = 移除
-                emit("uid=1(kris) hp=90 lv=1 title=\n")
+                emit("用户ID=1(kris) 生命值=90 等级=1 称号=\n")
         elif cmd == "man":
             # 在树后 man tree = 召唤那个男人; 其余一律按正常 man 处理
             if (args and args[0] == "tree" and st.cwd != "~"
                     and not st.egg and not st.man_gone):
                 offer(st)
             elif not args:
-                emit("What manual page do you want?\n")
+                emit("你想查看哪个命令的手册？\n")
             elif args[0] == "egg" and st.egg:
-                emit(EGG_LINE + "\n")
+                typewriter(EGG_LINE, newline=True, ff=False)
             else:
-                emit(f"No manual entry for {args[0]}\n")
+                emit(f"没有找到 {args[0]} 的手册条目\n")
         elif cmd == "cd":
             tgt = args[0] if args else "~"
             if tgt in ("~", "/", "..", "."):
                 if st.cwd != "~":
                     teardown_tree()      # 离开树后, 清理掉显示的树
+                stop_behind_music()
                 st.cwd = "~"
             elif tgt == "tree":
-                emit("cd: not a directory: tree\n")
+                emit("cd：tree 不是一个目录\n")
             elif tgt == ".behind" and st.cwd == "~":
                 enter_behind(st)
             elif tgt == ".behind":
                 pass
             else:
-                emit(f"cd: no such file or directory: {tgt}\n")
+                emit(f"cd：没有那个文件或目录：{tgt}\n")
         elif cmd == "pwd":
-            emit("/Users/" + USER + ("/.behind" if st.cwd != "~" else "") + "\n")
+            emit((os.path.expanduser("~") if IS_WINDOWS else "/Users/" + USER) + ("/.behind" if st.cwd != "~" else "") + "\n")
         elif cmd == "clear":
             with TREE.lock:
                 TREE.clear_text_area()
                 sys.stdout.flush()
         elif cmd in ("egg", "help") and (cmd == "egg" or args[:1] == ["egg"]):
             if cmd == "egg" and not st.egg:
-                emit("zsh: command not found: egg\n")
+                emit("找不到命令：egg\n")
             elif cmd == "egg" or st.egg:
-                emit(EGG_LINE + "\n")
+                typewriter(EGG_LINE, newline=True, ff=False)
             else:
-                emit("zsh: command not found: help\n")
+                emit("找不到命令：help\n")
         elif cmd in ("exit", "quit", "logout"):
             break
         else:
-            emit(f"zsh: command not found: {cmd}\n")
+            emit(f"找不到命令：{cmd}\n")
 
         # 男人还在等那句 man tree: 任何产生输出的输错都会把待填空旁白顶走,
         # 报错原地留几秒, 再把指令区刷回固定行位(显形按绝对行寻址, 不能漂移)
@@ -767,7 +1361,8 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         pass                    # ^C 静默退出, 不喷 traceback
     finally:
-        if OLD_TERM[0] is not None and sys.stdin.isatty():
+        if OLD_TERM[0] is not None and sys.stdin.isatty() and not IS_WINDOWS:
+            import termios
             termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN,
                               OLD_TERM[0])
         TREE.shutdown()
