@@ -2,11 +2,12 @@
 
 Windows port of eggdesktop.
 
-这是 eggdesktop 的 Windows 适配版本。
+这是 eggdesktop 的 Windows 适配版本，仅包含中文。
 
-## Windows 支持
+## Windows和中文支持
 
 本版本在原项目基础上增加了 Windows 支持，并针对 Windows 环境进行了适配。
+程序中的文字已翻译成中文
 
 ## 运行
 
